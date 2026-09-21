@@ -23,7 +23,7 @@ jobs:
 
       - name: Run Datadog detector
         env:
-          GT_TOKEN: ${{ secrets.GT_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GT_TOKEN }}
         run: |
           python datadog_detector.py \
             --days 14 \
