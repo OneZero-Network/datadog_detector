@@ -103,7 +103,7 @@ def main():
     cutoff = datetime.now(timezone.utc) - timedelta(days=a.days)
     funnel = dict(hits=0, unique_repos=0, org_owned=0, not_fork=0, active=0,
                   added_recently=0, history_verified=0, added_to_existing_manifest=0)
-    seen, rows = set(), []
+    seen, rows = {}, []
 
     per_target = max(a.max_repos // len(TARGETS), 1)
     for term, fname, pat in TARGETS:
@@ -120,13 +120,17 @@ def main():
             for it in items:
                 key = (it["repository"]["full_name"], it["path"])
                 if key not in seen and count < per_target:
-                    seen.add(key); count += 1
+                    seen[key] = (term, pat); count += 1
             if count >= per_target:
                 break
             time.sleep(7)  # code search ~10 req/min: pace per REQUEST, not per hit
     funnel["unique_repos"] = len(seen)
 
-    for repo, path in sorted(seen):
+    out_f, writer = None, None
+    for (repo, path), (dep, pat) in sorted(seen.items()):
+      try:
+        if repo.split('/')[0].lower() in ('datadog', 'datadog-labs'):
+            continue
         meta = get(f"/repos/{repo}").json()
         if meta.get("owner", {}).get("type") != "Organization":
             continue
@@ -139,7 +143,6 @@ def main():
             continue
         funnel["active"] += 1
 
-        pat = next(p for t, f, p in TARGETS if path.endswith(f))
         first, existed, exhausted = first_appearance(repo, path, pat)
         if not first:
             continue
@@ -161,7 +164,7 @@ def main():
             org_public_repos=org.get("public_repos", ""),
             repository=repo,
             manifest=path,
-            dependency=next(t for t, f, p in TARGETS if path.endswith(f)),
+            dependency=dep,
             first_detected=when.date().isoformat(),
             previously_present_manifest=existed,  # True = dep added to a pre-existing file
             history_truncated=exhausted,
@@ -175,12 +178,14 @@ def main():
             manual_credible_company="", manual_real_adoption="",
             manual_existing_datadog_customer="", manual_reason="",
         ))
-        print(f"  + {repo} ({when.date()})")
+        print(f"  + {repo} ({when.date()})", flush=True)
+        if writer is None:
+            out_f = open(a.out, "w", newline="")
+            writer = csv.DictWriter(out_f, fieldnames=rows[-1].keys()); writer.writeheader()
+        writer.writerow(rows[-1]); out_f.flush()
+      except Exception as e:
+        print(f"  ! skipped {repo}: {e!r}", file=sys.stderr)
 
-    if rows:
-        with open(a.out, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=rows[0].keys())
-            w.writeheader(); w.writerows(rows)
 
     print("\nFUNNEL (your key metric = last rows / first rows)")
     for k, v in funnel.items():
