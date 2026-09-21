@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-Disposable research script: find orgs that NEWLY added Datadog tracing SDKs
-to public repos. Goal: 20 credible examples, then manually inspect.
+Disposable research script v3: orgs that NEWLY added Datadog tracing SDKs.
+History via local git clone + `git log -S` (exact first appearance).
 
 Usage:
-  export GITHUB_TOKEN=ghp_...   (classic or fine-grained, public read is enough)
+  export GITHUB_TOKEN=ghp_...
   pip install requests
-  python datadog_detector.py --days 14 --max-repos 150
-
-Output: datadog_signals.csv  + printed funnel (your key metric).
+  python datadog_detector_v3.py --days 14 --max-repos 1000 --pages 10
 """
-import argparse, base64, csv, os, re, sys, time
+import argparse, csv, os, re, subprocess, sys, tempfile, time
 from datetime import datetime, timedelta, timezone
 import requests
 
@@ -23,63 +21,82 @@ S.headers.update({"Authorization": f"Bearer {TOKEN}",
                   "Accept": "application/vnd.github+json",
                   "X-GitHub-Api-Version": "2022-11-28"})
 
-# (search term, manifest filename, regex proving dependency present in content)
 TARGETS = [
-    ("dd-trace", "package.json", re.compile(r'"dd-trace"\s*:')),
-    ("ddtrace", "requirements.txt", re.compile(r'(?im)^\s*ddtrace\b')),
-    ("dd-trace-go", "go.mod", re.compile(r'DataDog/dd-trace-go')),
-    ("ddtrace", "Gemfile", re.compile(r"(?i)gem\s+['\"](ddtrace|datadog)['\"]")),
+    ("dd-trace", "package.json", '"dd-trace":'),
+    ("ddtrace", "requirements.txt", "ddtrace"),
+    ("dd-trace-go", "go.mod", "github.com/DataDog/dd-trace-go"),
+    ("ddtrace", "Gemfile", "ddtrace"),
 ]
+EXCLUDED = re.compile(r"(^|[/_.-])(fixtures?|tests?|examples?|demos?|benchmarks?)([/_.-]|$)", re.I)
+VENDOR_OWNERS = {"datadog", "datadog-labs"}
+GIT_ENV = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
 
 
 def get(url, **params):
-    """GET with rate-limit handling."""
+    r = None
     for _ in range(5):
         r = S.get(url if url.startswith("http") else API + url, params=params)
         if r.status_code in (403, 429):
-            reset = r.headers.get("X-RateLimit-Reset")
-            wait = r.headers.get("Retry-After")
-            if wait:
-                sleep = int(wait) + 1
+            reset, wait = r.headers.get("X-RateLimit-Reset"), r.headers.get("Retry-After")
+            if wait: sleep = int(wait) + 1
             elif r.headers.get("X-RateLimit-Remaining") == "0" and reset:
                 sleep = max(int(reset) - int(time.time()), 1) + 1
-            else:
-                sleep = 30
+            else: sleep = 30
             print(f"  rate limited, sleeping {sleep}s", file=sys.stderr)
-            time.sleep(min(sleep, 120))
-            continue
+            time.sleep(min(sleep, 120)); continue
         return r
     return r
 
 
-def file_at(repo, path, ref):
-    r = get(f"/repos/{repo}/contents/{path}", ref=ref)
-    if r.status_code != 200:
-        return None
-    j = r.json()
-    if isinstance(j, dict) and j.get("content"):
-        return base64.b64decode(j["content"]).decode("utf-8", "ignore")
-    return None
+def git(args, cwd=None, timeout=180):
+    """Never raises on timeout; returns object with returncode/stdout/stderr."""
+    try:
+        return subprocess.run(["git", *args], cwd=cwd, text=True, capture_output=True,
+                              timeout=timeout, env=GIT_ENV)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, "", "timeout")
 
 
-def first_appearance(repo, path, pattern, max_probe=12):
-    """Walk commits touching the manifest newest->oldest until dep is absent.
-    Returns (first_commit_dict or None, existed_before: bool, exhausted: bool)."""
-    r = get(f"/repos/{repo}/commits", path=path, per_page=max_probe)
-    if r.status_code != 200 or not r.json():
-        return None, False, False
-    commits = r.json()
-    earliest_with = None
-    for i, c in enumerate(commits):
-        content = file_at(repo, path, c["sha"])
-        if content is not None and pattern.search(content):
-            earliest_with = c
-            continue
-        # dependency absent at this commit -> earliest_with is where it was added
-        return earliest_with, content is not None, False
-    # never found absent within probe window: history longer than probe, or file born with dep
-    exhausted = len(commits) == max_probe
-    return earliest_with, False, exhausted
+def first_appearance(repo, path, needle, depth=200):
+    """Returns (sha, iso_date, is_root, verified). verified=True only if full
+    history was considered for the answer (never trusts a shallow boundary)."""
+    with tempfile.TemporaryDirectory(prefix="ddd-") as tmp:
+        d = os.path.join(tmp, "r")
+        c = git(["clone", "--depth", str(depth), "--filter=blob:none", "--no-checkout",
+                 "--single-branch", f"https://github.com/{repo}.git", d], timeout=300)
+        if c.returncode != 0:
+            print(f"  clone failed {repo}: {c.stderr.strip()[:200]}", file=sys.stderr)
+            return None, None, False, False
+
+        def search():
+            r = git(["log", "--reverse", "--format=%H", "-S", needle, "--", path], cwd=d, timeout=300)
+            shas = [x for x in r.stdout.split() if x] if r.returncode == 0 else None
+            return shas
+
+        def shallow_set():
+            p = os.path.join(d, ".git", "shallow")
+            return set(open(p).read().split()) if os.path.exists(p) else set()
+
+        shas = search()
+        if shas is None:
+            return None, None, False, False
+        # The oldest match inside a shallow window is a fake "addition"
+        # (boundary commit diffs against empty). Unshallow and redo.
+        if shallow_set() and (not shas or shas[0] in shallow_set()):
+            print(f"  unshallowing {repo}...", flush=True)
+            f = git(["fetch", "--unshallow", "--filter=blob:none"], cwd=d, timeout=900)
+            if f.returncode != 0:
+                print(f"  unshallow failed {repo}: {f.stderr.strip()[:200]}", file=sys.stderr)
+                return None, None, False, False
+            shas = search()
+            if shas is None:
+                return None, None, False, False
+        if not shas:
+            return None, None, False, True
+        sha = shas[0]
+        date = git(["show", "-s", "--format=%cI", sha], cwd=d, timeout=60).stdout.strip()
+        roots = set(git(["rev-list", "--max-parents=0", sha], cwd=d, timeout=60).stdout.split())
+        return sha, date, sha in roots, bool(date)
 
 
 def org_info(login):
@@ -95,103 +112,88 @@ def contributors(repo):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=14)
-    ap.add_argument("--max-repos", type=int, default=1000, help="total candidate cap, split evenly across targets")
-    ap.add_argument("--pages", type=int, default=3, help="search pages (100 hits each) per target")
+    ap.add_argument("--max-repos", type=int, default=1000)
+    ap.add_argument("--pages", type=int, default=3)
+    ap.add_argument("--clone-depth", type=int, default=200)
     ap.add_argument("--out", default="datadog_signals.csv")
     a = ap.parse_args()
-
     cutoff = datetime.now(timezone.utc) - timedelta(days=a.days)
-    funnel = dict(hits=0, unique_repos=0, org_owned=0, not_fork=0, active=0,
-                  added_recently=0, history_verified=0, added_to_existing_manifest=0)
-    seen, rows = {}, []
-
+    funnel = dict(hits=0, unique_repos=0, excluded_paths=0, org_owned=0, not_fork=0,
+                  active=0, history_verified=0, added_recently=0,
+                  added_to_existing_manifest=0, first_ever_in_repo=0, errors=0)
+    seen = {}
     per_target = max(a.max_repos // len(TARGETS), 1)
-    for term, fname, pat in TARGETS:
+
+    for term, fname, needle in TARGETS:
         count = 0
         for page in range(1, a.pages + 1):
             r = get("/search/code", q=f"{term} filename:{fname}", per_page=100, page=page)
             if r.status_code != 200:
-                print(f"search failed {r.status_code}: {r.text[:200]}", file=sys.stderr)
-                break
+                print(f"search failed {r.status_code}: {r.text[:200]}", file=sys.stderr); break
             items = r.json().get("items", [])
-            if not items:
-                break
+            if not items: break
             funnel["hits"] += len(items)
             for it in items:
-                key = (it["repository"]["full_name"], it["path"])
-                if key not in seen and count < per_target:
-                    seen[key] = (term, pat); count += 1
-            if count >= per_target:
-                break
-            time.sleep(7)  # code search ~10 req/min: pace per REQUEST, not per hit
+                repo, path = it["repository"]["full_name"], it["path"]
+                if EXCLUDED.search(path):
+                    funnel["excluded_paths"] += 1; continue
+                if (repo, path) not in seen and count < per_target:
+                    seen[(repo, path)] = (term, needle); count += 1
+            if count >= per_target: break
+            time.sleep(7)
     funnel["unique_repos"] = len(seen)
 
-    out_f, writer = None, None
-    for (repo, path), (dep, pat) in sorted(seen.items()):
-      try:
-        if repo.split('/')[0].lower() in ('datadog', 'datadog-labs'):
-            continue
-        meta = get(f"/repos/{repo}").json()
-        if meta.get("owner", {}).get("type") != "Organization":
-            continue
-        funnel["org_owned"] += 1
-        if meta.get("fork") or meta.get("archived"):
-            continue
-        funnel["not_fork"] += 1
-        pushed = datetime.fromisoformat(meta["pushed_at"].replace("Z", "+00:00"))
-        if pushed < cutoff:
-            continue
-        funnel["active"] += 1
+    writer = out_f = None
+    for (repo, path), (term, needle) in sorted(seen.items()):
+        try:
+            if repo.split("/")[0].lower() in VENDOR_OWNERS: continue
+            mr = get(f"/repos/{repo}")
+            if mr.status_code != 200: continue
+            meta = mr.json()
+            if meta.get("owner", {}).get("type") != "Organization": continue
+            funnel["org_owned"] += 1
+            if meta.get("fork") or meta.get("archived"): continue
+            funnel["not_fork"] += 1
+            if datetime.fromisoformat(meta["pushed_at"].replace("Z", "+00:00")) < cutoff: continue
+            funnel["active"] += 1
 
-        first, existed, exhausted = first_appearance(repo, path, pat)
-        if not first:
-            continue
-        when = datetime.fromisoformat(first["commit"]["committer"]["date"].replace("Z", "+00:00"))
-        if when < cutoff:
-            continue
-        funnel["added_recently"] += 1
-        if not exhausted:
+            sha, date, is_root, verified = first_appearance(repo, path, needle, a.clone_depth)
+            if not verified or not sha: continue
             funnel["history_verified"] += 1
-        if existed:
-            funnel["added_to_existing_manifest"] += 1
+            when = datetime.fromisoformat(date)
+            if when < cutoff: continue
+            funnel["added_recently"] += 1
+            funnel["first_ever_in_repo" if is_root else "added_to_existing_manifest"] += 1
 
-        org = org_info(meta["owner"]["login"])
-        created = datetime.fromisoformat(meta["created_at"].replace("Z", "+00:00"))
-        rows.append(dict(
-            organization=meta["owner"]["login"],
-            org_name=org.get("name") or "",
-            company_url=org.get("blog") or "",
-            org_public_repos=org.get("public_repos", ""),
-            repository=repo,
-            manifest=path,
-            dependency=dep,
-            first_detected=when.date().isoformat(),
-            previously_present_manifest=existed,  # True = dep added to a pre-existing file
-            history_truncated=exhausted,
-            commit_url=first["html_url"],
-            manifest_url=f"https://github.com/{repo}/blob/{meta['default_branch']}/{path}",
-            contributors=contributors(repo),
-            repo_age_days=(datetime.now(timezone.utc) - created).days,
-            stars=meta.get("stargazers_count", 0),
-            description=(meta.get("description") or "")[:120],
-            history_verified=not exhausted,  # only these count toward the 20
-            manual_credible_company="", manual_real_adoption="",
-            manual_existing_datadog_customer="", manual_reason="",
-        ))
-        print(f"  + {repo} ({when.date()})", flush=True)
-        if writer is None:
-            out_f = open(a.out, "w", newline="")
-            writer = csv.DictWriter(out_f, fieldnames=rows[-1].keys()); writer.writeheader()
-        writer.writerow(rows[-1]); out_f.flush()
-      except Exception as e:
-        print(f"  ! skipped {repo}: {e!r}", file=sys.stderr)
+            org = org_info(meta["owner"]["login"])
+            created = datetime.fromisoformat(meta["created_at"].replace("Z", "+00:00"))
+            row = dict(
+                organization=meta["owner"]["login"], org_name=org.get("name") or "",
+                company_url=org.get("blog") or "", org_public_repos=org.get("public_repos", ""),
+                repository=repo, manifest=path, dependency=term,
+                first_detected=when.date().isoformat(),
+                added_to_existing_manifest=not is_root, first_ever_in_repo=is_root,
+                history_verified=True,
+                commit_url=f"https://github.com/{repo}/commit/{sha}",
+                manifest_url=f"https://github.com/{repo}/blob/{meta['default_branch']}/{path}",
+                contributors=contributors(repo),
+                repo_age_days=(datetime.now(timezone.utc) - created).days,
+                stars=meta.get("stargazers_count", 0),
+                description=(meta.get("description") or "")[:120],
+                manual_credible_company="", manual_real_adoption="",
+                manual_existing_datadog_customer="", manual_reason="")
+            if writer is None:
+                out_f = open(a.out, "w", newline="", encoding="utf-8")
+                writer = csv.DictWriter(out_f, fieldnames=row.keys()); writer.writeheader()
+            writer.writerow(row); out_f.flush()
+            print(f"  + {repo} ({when.date()}) [{'repo-root' if is_root else 'existing repo'}]", flush=True)
+        except Exception as e:
+            funnel["errors"] += 1
+            print(f"  ! skipped {repo}: {e!r}", file=sys.stderr)
 
-
-    print("\nFUNNEL (your key metric = last rows / first rows)")
-    for k, v in funnel.items():
-        print(f"  {k:32s} {v}")
-    print(f"\nWrote {len(rows)} rows to {a.out}. Now inspect EVERY row by hand and mark:")
-    print("  credible company? real adoption (not tutorial/demo)? already-known to vendor?")
+    print("\nFUNNEL")
+    for k, v in funnel.items(): print(f"  {k:32s} {v}")
+    print(f"\nRows written: see {a.out}. Inspect EVERY row by hand.")
 
 
 if __name__ == "__main__":
