@@ -1,0 +1,38 @@
+name: Datadog Signal Research
+
+on:
+  workflow_dispatch:
+
+jobs:
+  detector:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run Datadog detector
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python datadog_detector.py \
+            --days 14 \
+            --max-repos 1000 \
+            --pages 10 \
+            --out datadog_signals.csv
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: datadog-signal-results
+          path: datadog_signals.csv
